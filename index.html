@@ -49,6 +49,390 @@ let scale = 1, ox = 0, oy = 0, edges = [];
 let charge = 0, maxDist = 0, isHolding = false;
 let waveTimer = 0, pulseEnvelope = 0;
 let lastTime = null;
+let fullyCharged = false; 
+
+const CHARGE_SPEED = 25;  
+
+// Camera zoom: Locked to 1.0 to show the whole board at once
+let cameraZoom = 1.0; 
+
+function generate() {
+  edges = Array.from({length: ROWS}, () =>
+    Array.from({length: COLS}, () => ({ T:false, R:false, B:false, L:false, dist: Infinity, active: false }))
+  );
+
+  const rawActive = Array.from({length: QH}, () => Array(QW).fill(false));
+  const qActive   = Array.from({length: QH}, () => Array(QW).fill(false));
+
+  function fillDisc(r0, c0, rad) {
+    const ri = Math.ceil(rad);
+    for (let dr = -ri; dr <= ri; dr++) {
+      for (let dc = -ri; dc <= ri; dc++) {
+        if (dr * dr + dc * dc <= rad * rad) {
+          const nr = r0 + dr, nc = c0 + dc;
+          if (nr >= 0 && nr < QH && nc >= 0 && nc < QW) rawActive[nr][nc] = true;
+        }
+      }
+    }
+  }
+
+  function drawCorridor(r1, c1, r2, c2, w) {
+    const steps = Math.max(Math.abs(r2 - r1), Math.abs(c2 - c1));
+    if (steps === 0) return;
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      fillDisc(Math.round(r1 + (r2 - r1) * t), Math.round(c1 + (c2 - c1) * t), w);
+    }
+  }
+
+  const anchor = { r: QH - 1, c: QW - 1 };
+  fillDisc(anchor.r, anchor.c, 3 + Math.random() * 5);
+
+  const numBlobs = 4 + Math.floor(Math.random() * 6);
+  const blobs = [];
+  for (let i = 0; i < numBlobs; i++) {
+    blobs.push({
+      r: Math.floor(Math.random() * QH),
+      c: Math.floor(Math.random() * QW),
+      rad: 2 + Math.random() * 10
+    });
+  }
+  for (const b of blobs) fillDisc(b.r, b.c, b.rad);
+
+  for (const b of blobs) {
+    drawCorridor(anchor.r, anchor.c, b.r, b.c, 0.6 + Math.random() * 1.8);
+  }
+
+  for (let i = 0; i < blobs.length - 1; i++) {
+    if (Math.random() < 0.45) {
+      const j = i + 1 + Math.floor(Math.random() * (blobs.length - i - 1));
+      drawCorridor(blobs[i].r, blobs[i].c, blobs[j].r, blobs[j].c, 0.5 + Math.random() * 1.2);
+    }
+  }
+
+  const fq = [[QH - 1, QW - 1]];
+  qActive[QH - 1][QW - 1] = true;
+  while (fq.length) {
+    const [r, c] = fq.shift();
+    [[0,1],[0,-1],[1,0],[-1,0]].forEach(([dr, dc]) => {
+      const nr = r + dr, nc = c + dc;
+      if (nr >= 0 && nr < QH && nc >= 0 && nc < QW && rawActive[nr][nc] && !qActive[nr][nc]) {
+        qActive[nr][nc] = true;
+        fq.push([nr, nc]);
+      }
+    });
+  }
+  qActive[QH - 1][QW - 1] = true;
+
+  const qEdges = Array.from({length: QH}, () => Array.from({length: QW}, () => ({ T:false, R:false, B:false, L:false })));
+  const visited = Array.from({length: QH}, () => Array(QW).fill(false));
+  const stack = [[QH-1, QW-1]];
+  visited[QH-1][QW-1] = true;
+
+  while (stack.length) {
+    const [r,c] = stack[stack.length-1];
+    const dirs = [[-1,0,'T','B'],[1,0,'B','T'],[0,-1,'L','R'],[0,1,'R','L']].sort(() => Math.random() - 0.5);
+    let moved = false;
+    for (const [dr, dc, s, o] of dirs) {
+      const nr = r + dr, nc = c + dc;
+      if (nr >= 0 && nr < QH && nc >= 0 && nc < QW && qActive[nr][nc] && !visited[nr][nc]) {
+        visited[nr][nc] = true;
+        qEdges[r][c][s] = qEdges[nr][nc][o] = true;
+        stack.push([nr, nc]); moved = true; break;
+      }
+    }
+    if (!moved) stack.pop();
+  }
+
+  for (let r = 0; r < QH; r++) {
+    for (let c = 0; c < QW; c++) {
+      if (!qActive[r][c]) continue;
+      const e = qEdges[r][c];
+      const mirror = (row, col, cfg) => {
+        edges[row][col].active = true;
+        edges[row][col].T = cfg.T; edges[row][col].R = cfg.R;
+        edges[row][col].B = cfg.B; edges[row][col].L = cfg.L;
+      };
+      mirror(r, c, e);
+      mirror(r, MIDX+1+(QW-1-c), { T:e.T, R:e.L, B:e.B, L:e.R });
+      mirror(MIDY+1+(QH-1-r), c, { T:e.B, R:e.R, B:e.T, L:e.L });
+      mirror(MIDY+1+(QH-1-r), MIDX+1+(QW-1-c), { T:e.B, R:e.L, B:e.T, L:e.R });
+    }
+  }
+
+  edges[MIDY][MIDX].active = true;
+  edges[MIDY][MIDX].dist = 0;
+
+  if (qActive[QH-1][QW-1]) {
+    edges[MIDY][MIDX].T = edges[MIDY][MIDX].L = true;
+    edges[MIDY-1][MIDX].B = edges[MIDY-1][MIDX].active = true;
+    edges[MIDY][MIDX-1].R = edges[MIDY][MIDX-1].active = true;
+    edges[MIDY][MIDX].R = true;
+    edges[MIDY][MIDX+1].L = edges[MIDY][MIDX+1].active = true;
+    edges[MIDY][MIDX].B = true;
+    edges[MIDY+1][MIDX].T = edges[MIDY+1][MIDX].active = true;
+  }
+
+  for (let r = 0; r < QH; r++) {
+    if (!qActive[r][QW-1]) continue;
+    const prevOn = r > 0      && qActive[r-1][QW-1];
+    const nextOn = r < QH-1   && qActive[r+1][QW-1];
+    if (prevOn && nextOn) continue;
+    edges[r][MIDX-1].R = edges[r][MIDX].L = true;
+    edges[r][MIDX].R = edges[r][MIDX+1].L = true;
+    edges[r][MIDX].active = true;
+    const mirR = MIDY+1+(QH-1-r);
+    edges[mirR][MIDX-1].R = edges[mirR][MIDX].L = true;
+    edges[mirR][MIDX].R = edges[mirR][MIDX+1].L = true;
+    edges[mirR][MIDX].active = true;
+  }
+  for (let c = 0; c < QW; c++) {
+    if (!qActive[QH-1][c]) continue;
+    const prevOn = c > 0      && qActive[QH-1][c-1];
+    const nextOn = c < QW-1   && qActive[QH-1][c+1];
+    if (prevOn && nextOn) continue;
+    edges[MIDY-1][c].B = edges[MIDY][c].T = true;
+    edges[MIDY][c].B = edges[MIDY+1][c].T = true;
+    edges[MIDY][c].active = true;
+    const mirC = MIDX+1+(QW-1-c);
+    edges[MIDY-1][mirC].B = edges[MIDY][mirC].T = true;
+    edges[MIDY][mirC].B = edges[MIDY+1][mirC].T = true;
+    edges[MIDY][mirC].active = true;
+  }
+
+  const queue = [[MIDY, MIDX]];
+  maxDist = 0;
+  while (queue.length > 0) {
+    const [r, c] = queue.shift();
+    const curr = edges[r][c];
+    const nbs = [{dr:-1,dc:0,s:'T',o:'B'},{dr:1,dc:0,s:'B',o:'T'},{dr:0,dc:-1,s:'L',o:'R'},{dr:0,dc:1,s:'R',o:'L'}];
+    for (const n of nbs) {
+      const nr = r + n.dr, nc = c + n.dc;
+      if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS &&
+          edges[nr][nc].active && curr[n.s] && edges[nr][nc][n.o] && edges[nr][nc].dist === Infinity) {
+        edges[nr][nc].dist = curr.dist + 1;
+        maxDist = Math.max(maxDist, edges[nr][nc].dist);
+        queue.push([nr, nc]);
+      }
+    }
+  }
+}
+
+function draw() {
+  ctx.fillStyle = C_BG;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+
+  const fitScale = Math.min(canvas.height / (ROWS * TILE), canvas.width / (COLS * TILE)) * 0.95;
+  const dynScale = fitScale * cameraZoom;
+  const hX = MIDX * TILE + TILE / 2, hY = MIDY * TILE + TILE / 2;
+  const dynOx = canvas.width  / 2 - hX * dynScale;
+  const dynOy = canvas.height / 2 - hY * dynScale;
+
+  ctx.translate(dynOx, dynOy);
+  ctx.scale(dynScale, dynScale);
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  const now = Date.now();
+  const pInt = pulseEnvelope * (0.5 - Math.cos(waveTimer * 0.08) * 0.5);
+
+  const rHub = Math.floor(RGB_GLOW.r + (RGB_CORE.r - RGB_GLOW.r) * pInt);
+  const gHub = Math.floor(RGB_GLOW.g + (RGB_CORE.g - RGB_GLOW.g) * pInt);
+  const bHub = Math.floor(RGB_GLOW.b + (RGB_CORE.b - RGB_GLOW.b) * pInt);
+  const currentColor = `rgb(${rHub}, ${gHub}, ${bHub})`;
+
+  const rFar = Math.floor(RGB_FAR_GLOW.r + (RGB_FAR_CORE.r - RGB_FAR_GLOW.r) * pInt);
+  const gFar = Math.floor(RGB_FAR_GLOW.g + (RGB_FAR_CORE.g - RGB_FAR_GLOW.g) * pInt);
+  const bFar = Math.floor(RGB_FAR_GLOW.b + (RGB_FAR_CORE.b - RGB_FAR_GLOW.b) * pInt);
+  const farColor = `rgb(${rFar}, ${gFar}, ${bFar})`;
+
+  const hubPulseT   = (Math.sin(now / 700) + 1) / 2;
+  const hubWhite = Math.floor(200 + 55 * hubPulseT);
+  const hubPulseColor = `rgb(${hubWhite}, ${hubWhite}, ${hubWhite})`;
+
+  const gradRadius = Math.sqrt(Math.pow(ROWS * TILE, 2) + Math.pow(COLS * TILE, 2)) * 0.5;
+  const lineGrad = ctx.createRadialGradient(hX, hY, 0, hX, hY, gradRadius);
+  lineGrad.addColorStop(0,    currentColor);
+  lineGrad.addColorStop(0.12, currentColor);
+  lineGrad.addColorStop(1,    farColor);
+
+  function addTilePath(e, r, c) {
+    const px = c * TILE, py = r * TILE;
+    const cx = px + TILE / 2, cy = py + TILE / 2;
+    const arms = (e.T?1:0) + (e.R?1:0) + (e.B?1:0) + (e.L?1:0);
+    if (arms === 2 && !((e.T && e.B) || (e.L && e.R))) {
+      if      (e.T && e.R) { ctx.moveTo(cx, py);        ctx.lineTo(cx, cy); ctx.lineTo(px+TILE, cy); }
+      else if (e.R && e.B) { ctx.moveTo(px+TILE, cy);   ctx.lineTo(cx, cy); ctx.lineTo(cx, py+TILE); }
+      else if (e.B && e.L) { ctx.moveTo(cx, py+TILE);   ctx.lineTo(cx, cy); ctx.lineTo(px, cy); }
+      else if (e.L && e.T) { ctx.moveTo(px, cy);        ctx.lineTo(cx, cy); ctx.lineTo(cx, py); }
+    } else {
+      if (e.T) { ctx.moveTo(cx, py);        ctx.lineTo(cx, cy); }
+      if (e.R) { ctx.moveTo(px + TILE, cy); ctx.lineTo(cx, cy); }
+      if (e.B) { ctx.moveTo(cx, py + TILE); ctx.lineTo(cx, cy); }
+      if (e.L) { ctx.moveTo(px, cy);        ctx.lineTo(cx, cy); }
+    }
+  }
+
+  const baseAlpha = 0.85 + pInt * 0.15;
+  ctx.globalAlpha = baseAlpha;
+  ctx.strokeStyle = lineGrad;
+  ctx.lineWidth   = LW + pInt * 8;
+  ctx.shadowColor = currentColor;
+  ctx.shadowBlur  = 14 + pInt * 22;
+  ctx.beginPath();
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const e = edges[r][c];
+      if (!e.active || e.dist > charge || (r === MIDY && c === MIDX)) continue;
+      addTilePath(e, r, c);
+    }
+  }
+  ctx.stroke();
+
+  ctx.strokeStyle = lineGrad;
+  ctx.lineWidth   = LW + pInt * 8;
+  ctx.shadowBlur  = 38;
+
+  const leadingTiles = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const e = edges[r][c];
+      if (!e.active || e.dist <= charge || e.dist > charge + 1 || (r === MIDY && c === MIDX)) continue;
+      const edgeFraction = charge - e.dist + 1;
+      leadingTiles.push({ e, r, c, edgeFraction });
+      ctx.globalAlpha = baseAlpha * edgeFraction;
+      ctx.beginPath();
+      addTilePath(e, r, c);
+      ctx.stroke();
+    }
+  }
+
+  if (charge > 0 && charge < maxDist) {
+    ctx.shadowBlur = 0;
+    for (const { r, c, edgeFraction } of leadingTiles) {
+      const { x: tx, y: ty } = { x: c * TILE + TILE / 2, y: r * TILE + TILE / 2 };
+      const dotR = LW * 0.75;
+      const dotGlow = ctx.createRadialGradient(tx, ty, 0, tx, ty, dotR * 3);
+      dotGlow.addColorStop(0,   `rgba(255,255,255,${0.95 * edgeFraction})`);
+      dotGlow.addColorStop(0.3, `rgba(255,255,255,${0.5  * edgeFraction})`);
+      dotGlow.addColorStop(1,   'rgba(255,255,255,0)');
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = dotGlow;
+      ctx.shadowColor = 'white';
+      ctx.shadowBlur  = 18;
+      ctx.beginPath();
+      ctx.arc(tx, ty, dotR * 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'white';
+      ctx.globalAlpha = edgeFraction;
+      ctx.beginPath();
+      ctx.arc(tx, ty, dotR * 0.55, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  ctx.globalAlpha = 1;
+  const hubPulse = 1.3 + Math.sin(now / 420) * 0.35 * (isHolding ? 1.6 : 1);
+  const grd = ctx.createRadialGradient(hX, hY, 0, hX, hY, TILE * hubPulse * 1.6);
+  grd.addColorStop(0,   `rgba(255,255,255,0.45)`);
+  grd.addColorStop(0.4, `rgba(255,255,255,0.08)`);
+  grd.addColorStop(1,   'transparent');
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = grd;
+  ctx.beginPath(); ctx.arc(hX, hY, TILE * hubPulse * 1.6, 0, Math.PI * 2); ctx.fill();
+
+  const ringAlpha = 0.25 + Math.sin(now / 280) * 0.15;
+  ctx.globalAlpha = ringAlpha;
+  ctx.strokeStyle = hubPulseColor;
+  ctx.lineWidth   = 2.5;
+  ctx.shadowColor = hubPulseColor;
+  ctx.shadowBlur  = 12;
+  ctx.beginPath(); ctx.arc(hX, hY, TILE * 0.55, 0, Math.PI * 2); ctx.stroke();
+
+  ctx.globalAlpha = 1;
+  ctx.shadowBlur  = 28 + pInt * 18;
+  ctx.fillStyle   = hubPulseColor;
+  ctx.shadowColor = hubPulseColor;
+  ctx.beginPath(); ctx.arc(hX, hY, LW * 1.1, 0, Math.PI * 2); ctx.fill();
+
+  ctx.restore();
+
+  const vx = canvas.width / 2, vy = canvas.height / 2;
+  const vr = Math.max(canvas.width, canvas.height) * 0.78;
+  const vig = ctx.createRadialGradient(vx, vy, vr * 0.18, vx, vy, vr);
+  vig.addColorStop(0, 'rgba(0,0,0,0)');
+  vig.addColorStop(1, 'rgba(0,0,0,0.62)');
+  ctx.fillStyle = vig;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+window.addEventListener('mousedown', () => isHolding = true);
+window.addEventListener('mouseup',   () => isHolding = false);
+window.addEventListener('touchstart', e => { e.preventDefault(); isHolding = true; }, { passive: false });
+window.addEventListener('touchend',  () => isHolding = false);
+
+function update(timestamp) {
+  const dt = lastTime !== null ? Math.min((timestamp - lastTime) / 1000, 0.1) : 0;
+  lastTime = timestamp;
+
+  if (isHolding) {
+    charge = Math.min(charge + CHARGE_SPEED * dt, maxDist);
+  } else {
+    charge = Math.max(charge - CHARGE_SPEED * dt, 0);
+  }
+
+  // Zoom logic removed — camera remains static at 1.0
+
+  if (charge >= maxDist) {
+    fullyCharged = true;
+    waveTimer++;
+    pulseEnvelope = Math.min(pulseEnvelope + 0.015, 1);
+  } else {
+    pulseEnvelope = Math.max(pulseEnvelope - 0.03, 0);
+    if (!isHolding) waveTimer = 0;
+    if (fullyCharged && charge <= 0) {
+      fullyCharged = false;
+      rerollPalette();
+      generate();
+    }
+  }
+
+  draw();
+  requestAnimationFrame(update);
+}
+
+function init() {
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+  charge = 0;
+  cameraZoom = 1.0; 
+  fullyCharged = false;
+  generate();
+}
+
+init();
+requestAnimationFrame(update);
+window.addEventListener('resize', init);
+</script>
+</body>
+</html>
+  const FAR_HUE = (HUE + 80 + Math.random() * 100) % 360;
+  RGB_GLOW     = hslToRgb(HUE,     65,  58);
+  RGB_CORE     = hslToRgb(HUE,     100, 72);
+  RGB_FAR_GLOW = hslToRgb(FAR_HUE, 65,  58);
+  RGB_FAR_CORE = hslToRgb(FAR_HUE, 100, 72);
+}
+rerollPalette();
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let scale = 1, ox = 0, oy = 0, edges = [];
+let charge = 0, maxDist = 0, isHolding = false;
+let waveTimer = 0, pulseEnvelope = 0;
+let lastTime = null;
 let fullyCharged = false; // true once circuit has been fully lit
 
 const CHARGE_SPEED = 25;  // dist-units per second — only while holding
