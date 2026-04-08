@@ -8,10 +8,40 @@
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: #080705; overflow: hidden; touch-action: none; cursor: pointer; }
   canvas { display: block; }
+
+  #rec-btn {
+    position: fixed;
+    bottom: 22px;
+    right: 22px;
+    z-index: 100;
+    background: rgba(255,255,255,0.1);
+    border: 1.5px solid rgba(255,255,255,0.25);
+    color: #fff;
+    font-family: system-ui, sans-serif;
+    font-size: 13px;
+    letter-spacing: 0.04em;
+    padding: 8px 18px;
+    border-radius: 999px;
+    cursor: pointer;
+    backdrop-filter: blur(6px);
+    transition: background 0.2s, border-color 0.2s;
+    user-select: none;
+  }
+  #rec-btn:hover { background: rgba(255,255,255,0.18); border-color: rgba(255,255,255,0.5); }
+  #rec-btn.recording {
+    background: rgba(220,40,40,0.35);
+    border-color: rgba(255,80,80,0.7);
+    animation: pulse-rec 1.2s ease-in-out infinite;
+  }
+  @keyframes pulse-rec {
+    0%,100% { box-shadow: 0 0 0 0 rgba(255,60,60,0.5); }
+    50%      { box-shadow: 0 0 0 6px rgba(255,60,60,0); }
+  }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
+<button id="rec-btn">&#9654; Record</button>
 
 <script>
 /** CONFIG **/
@@ -22,6 +52,24 @@ const QW = 24, QH = 28;
 const COLS = 2 * QW + 1;
 const ROWS = 2 * QH + 1;
 const MIDX = QW, MIDY = QH;
+
+// Safety margin: lit bbox occupies at most this fraction of the half-screen.
+// Smaller = more black border around the shape.
+const ZOOM_MARGIN = 0.90;
+// Zoom multiplier range (higher = closer).
+const ZOOM_MAX = 3.8;   // starting zoom (intimate, hub fills screen)
+const ZOOM_MIN = 1.0;   // fully zoomed out (fitScale × 1)
+
+// ── Cinematic curve ──────────────────────────────────────────────────────────
+// The camera pulls out on its OWN time curve, independently of charge speed.
+// Phase 1 (0 → HOLD_PAUSE): camera barely moves — builds suspense close to hub.
+// Phase 2 (HOLD_PAUSE → CINEMATIC_DURATION): sweeping dramatic reveal.
+const CINEMATIC_DURATION = 5.5;  // seconds for the full pull-out
+const HOLD_PAUSE         = 0.35; // seconds of near-stillness at the start
+
+// Camera lerp — high enough to faithfully track the cinematic curve,
+// low enough to feel weighty (not instant).
+const ZOOM_LERP = 9;
 
 /** PALETTE **/
 function hslToRgb(h, s, l) {
@@ -49,6 +97,16 @@ let edges = [], charge = 0, maxDist = 0;
 let isHolding = false, waveTimer = 0, pulseEnvelope = 0;
 let lastTime = null, fullyCharged = false;
 const CHARGE_SPEED = 22;
+
+/**
+ * distBBox[d] = { minR, maxR, minC, maxC }
+ * The cumulative bounding box (in grid coordinates) of all active tiles
+ * whose BFS distance from the hub is <= d.  Built once after each generate().
+ * Used by the camera to compute the exact zoom needed to show all lit tiles.
+ */
+let distBBox = [];
+let cameraZoom = ZOOM_MAX;
+let holdElapsed = 0;   // seconds the user has been continuously holding
 
 /** NOISE **/
 function hash21(x, y) {
@@ -104,7 +162,6 @@ function generate() {
     }
   }
 
-  // Tendrils
   const numTendrils = 2 + Math.floor(Math.random() * 5);
   for (let i = 0; i < numTendrils; i++) {
     let sr = -1, sc = -1;
@@ -160,7 +217,6 @@ function generate() {
     }
   }
 
-  // BFS connectivity from anchor
   const fq = [[QH - 1, QW - 1]];
   qActive[QH - 1][QW - 1] = true;
   while (fq.length) {
@@ -174,7 +230,6 @@ function generate() {
   }
   qActive[QH - 1][QW - 1] = true;
 
-  // Spanning-tree maze
   const qEdges = Array.from({ length: QH }, () =>
     Array.from({ length: QW }, () => ({ T: false, R: false, B: false, L: false }))
   );
@@ -196,7 +251,6 @@ function generate() {
     if (!moved) stack.pop();
   }
 
-  // Mirror all 4 quadrants perfectly
   for (let r = 0; r < QH; r++) {
     for (let c = 0; c < QW; c++) {
       if (!qActive[r][c]) continue;
@@ -269,6 +323,84 @@ function generate() {
       }
     }
   }
+
+  /**
+   * PRECOMPUTE distBBox[d]: the cumulative bounding box (grid row/col) of all
+   * active tiles with BFS distance <= d.  This is what lets us compute exactly
+   * the zoom needed to frame all lit tiles without any guesswork.
+   */
+  distBBox = [];
+  // Start with just the hub tile
+  let bbox = { minR: MIDY, maxR: MIDY, minC: MIDX, maxC: MIDX };
+  distBBox[0] = { ...bbox };
+
+  // Collect tiles grouped by distance
+  const byDist = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const e = edges[r][c];
+      if (!e.active || e.dist === Infinity || e.dist === 0) continue;
+      const d = e.dist;
+      if (!byDist[d]) byDist[d] = [];
+      byDist[d].push({ r, c });
+    }
+  }
+  for (let d = 1; d <= maxDist; d++) {
+    if (byDist[d]) {
+      for (const { r, c } of byDist[d]) {
+        if (r < bbox.minR) bbox.minR = r;
+        if (r > bbox.maxR) bbox.maxR = r;
+        if (c < bbox.minC) bbox.minC = c;
+        if (c > bbox.maxC) bbox.maxC = c;
+      }
+    }
+    distBBox[d] = { ...bbox };
+  }
+}
+
+/**
+ * Geometry safety clamp — returns the MAXIMUM zoom at which the cumulative
+ * bounding box of all lit tiles (up to distance d) still fits in the screen.
+ * Used as a hard upper bound on cameraZoom; the cinematic curve drives the
+ * actual motion but can never exceed this, so no tile ever leaves the frame.
+ */
+function maxZoomForDist(d) {
+  if (!distBBox[d]) return ZOOM_MAX;
+  const bb = distBBox[d];
+
+  const fitScale = Math.min(
+    canvas.height / (ROWS * TILE),
+    canvas.width  / (COLS * TILE)
+  ) * 0.95;
+
+  const halfC = Math.max(bb.maxC - MIDX, MIDX - bb.minC) + 0.5;
+  const halfR = Math.max(bb.maxR - MIDY, MIDY - bb.minR) + 0.5;
+
+  const zoomFromW = halfC > 0 ? (canvas.width  / 2 * ZOOM_MARGIN) / (halfC * TILE * fitScale) : ZOOM_MAX;
+  const zoomFromH = halfR > 0 ? (canvas.height / 2 * ZOOM_MARGIN) / (halfR * TILE * fitScale) : ZOOM_MAX;
+
+  return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.min(zoomFromW, zoomFromH)));
+}
+
+/**
+ * Cinematic target zoom — driven purely by holdElapsed time, NOT by charge.
+ *
+ * Two phases:
+ *   Phase 1 (0 → HOLD_PAUSE):  micro-drift only — the camera holds close to
+ *     the hub, building tension while the first lines spark out.
+ *   Phase 2 (HOLD_PAUSE → CINEMATIC_DURATION):  cubic ease-in pull-back.
+ *     The camera starts slow then sweeps dramatically outward — crane-shot
+ *     feel.  The acceleration peaks around 60-70% of the pull-back.
+ */
+function cinematicTarget() {
+  if (holdElapsed <= HOLD_PAUSE) {
+    // Tiny drift (5% of range) during the pause beat
+    const micro = holdElapsed / HOLD_PAUSE;
+    return ZOOM_MAX - (ZOOM_MAX - ZOOM_MIN) * 0.05 * micro * micro;
+  }
+  const t     = Math.min((holdElapsed - HOLD_PAUSE) / (CINEMATIC_DURATION - HOLD_PAUSE), 1);
+  const eased = t * t * t;   // cubic ease-in: slow → rapid acceleration
+  return ZOOM_MAX + (ZOOM_MIN - ZOOM_MAX) * (0.05 + eased * 0.95);
 }
 
 /** DRAWING **/
@@ -295,9 +427,10 @@ function draw() {
   ctx.save();
 
   const fitScale = Math.min(canvas.height / (ROWS * TILE), canvas.width / (COLS * TILE)) * 0.95;
+  const dynScale = fitScale * cameraZoom;
   const hX = MIDX * TILE + TILE / 2, hY = MIDY * TILE + TILE / 2;
-  ctx.translate(canvas.width / 2 - hX * fitScale, canvas.height / 2 - hY * fitScale);
-  ctx.scale(fitScale, fitScale);
+  ctx.translate(canvas.width / 2 - hX * dynScale, canvas.height / 2 - hY * dynScale);
+  ctx.scale(dynScale, dynScale);
   ctx.lineCap = 'round'; ctx.lineJoin = 'round';
 
   const now = Date.now();
@@ -404,10 +537,13 @@ function draw() {
 }
 
 /** INPUT **/
-window.addEventListener('mousedown',  () => isHolding = true);
-window.addEventListener('mouseup',    () => isHolding = false);
-window.addEventListener('touchstart', e => { e.preventDefault(); isHolding = true; }, { passive: false });
-window.addEventListener('touchend',   () => isHolding = false);
+window.addEventListener('mousedown',  e => { if (e.target !== recBtn) isHolding = true; });
+window.addEventListener('mouseup',    e => { if (e.target !== recBtn) isHolding = false; });
+window.addEventListener('touchstart', e => {
+  if (e.target === recBtn) return;
+  e.preventDefault(); isHolding = true;
+}, { passive: false });
+window.addEventListener('touchend',   e => { if (e.target !== recBtn) isHolding = false; });
 
 /** LOOP **/
 function update(timestamp) {
@@ -415,10 +551,17 @@ function update(timestamp) {
   lastTime = timestamp;
 
   if (isHolding) {
-    charge = Math.min(charge + CHARGE_SPEED * dt, maxDist);
+    charge       = Math.min(charge + CHARGE_SPEED * dt, maxDist);
+    holdElapsed  = Math.min(holdElapsed + dt, CINEMATIC_DURATION);
   } else {
-    charge = Math.max(charge - CHARGE_SPEED * 2 * dt, 0);
+    charge       = Math.max(charge - CHARGE_SPEED * 2 * dt, 0);
+    // Retreat holdElapsed faster than it advances so the camera snaps back
+    // with a little more urgency than the slow cinematic push-out.
+    holdElapsed  = Math.max(holdElapsed - dt * 2, 0);
   }
+
+  // ── CAMERA (zoom removed — fixed at full fit) ─────────────────────────────
+  cameraZoom = ZOOM_MIN;
 
   if (charge >= maxDist) {
     fullyCharged = true;
@@ -429,6 +572,7 @@ function update(timestamp) {
     if (!isHolding) waveTimer = 0;
     if (fullyCharged && charge <= 0) {
       fullyCharged = false;
+      holdElapsed  = 0;
       rerollPalette();
       generate();
     }
@@ -442,12 +586,45 @@ function init() {
   canvas.width  = window.innerWidth;
   canvas.height = window.innerHeight;
   charge = 0; fullyCharged = false;
+  holdElapsed = 0;
+  cameraZoom = ZOOM_MIN;
   generate();
 }
 
 init();
 requestAnimationFrame(update);
 window.addEventListener('resize', init);
+
+/* ── VIDEO RECORDING ─────────────────────────────────────────────────────── */
+const recBtn = document.getElementById('rec-btn');
+let mediaRecorder = null;
+let recordedChunks = [];
+
+recBtn.addEventListener('click', () => {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+  } else {
+    recordedChunks = [];
+    const mimeTypes = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+    const mimeType = mimeTypes.find(m => MediaRecorder.isTypeSupported(m)) || '';
+    const stream = canvas.captureStream(60);
+    mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+    mediaRecorder.ondataavailable = e => { if (e.data && e.data.size > 0) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = () => {
+      recBtn.classList.remove('recording');
+      recBtn.textContent = '⏳ Saving…';
+      const blob = new Blob(recordedChunks, { type: mimeType || 'video/webm' });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href = url; a.download = `conduit-trace-${Date.now()}.webm`; a.click();
+      URL.revokeObjectURL(url);
+      recBtn.textContent = '⏺ Record';
+    };
+    mediaRecorder.start();
+    recBtn.classList.add('recording');
+    recBtn.textContent = '⏹ Stop';
+  }
+});
 </script>
 </body>
 </html>
